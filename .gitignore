@@ -1,0 +1,36 @@
+# Python environments
+venv/
+env/
+sentinel_env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Dataset
+processing/SENTINEL_AI/datasets/raw/
+processing/SENTINEL_AI/datasets/processed/
+
+# Personal webcam captures
+processing/SENTINEL_AI/webcam_captures/
+camera/captures/
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local database and sensor history
+*.db
+*.sqlite3
+
+# Training temporary files
+*.pth.tmp
+*.pt.tmp

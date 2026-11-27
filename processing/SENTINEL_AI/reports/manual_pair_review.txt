@@ -1,0 +1,27 @@
+SENTINEL — MANUAL IMAGE REVIEW
+================================
+
+Review method:
+Visual comparison of six highest-similarity
+training/testing image pairs.
+
+Result:
+Pair 1: Same
+Pair 2: Same
+Pair 3: Same
+Pair 4: Same
+Pair 5: Same
+Pair 6: Same
+
+Confirmed visual matches: 6
+Total pairs reviewed: 6
+
+Interpretation:
+These six pairs are likely train/test leakage
+candidates and require grouping before final
+dataset splitting.
+
+Important:
+This review does not establish that all 227
+shared fallback identifiers are duplicates.
+No dataset images have been deleted or moved.

@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@1.4.0/dist/index.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    html, body { margin:0; padding:0; background:transparent; overflow:hidden; }
+    #sentinel-chart { width:100%; height:330px; }
+  </style>
+</head>
+<body>
+  <div id="sentinel-chart"></div>
+  <script>
+    const chart = document.getElementById("sentinel-chart");
+    let chartReady = false;
+    let lastArgs = null;
+
+    function renderChart(args) {
+      if (!window.Plotly || !args) {
+        lastArgs = args;
+        return;
+      }
+
+      const rawTrace = {
+        x: args.x,
+        y: args.raw,
+        type: "scatter",
+        mode: "lines+markers",
+        name: "Raw temperature",
+        line: {color:"#55B4E5", width:2.5},
+        marker: {color:"#55B4E5", size:4},
+        hovertemplate:"Recent sample %{x}<br>Temperature: %{y:.1f} °C<extra></extra>"
+      };
+
+      const averageTrace = {
+        x: args.x,
+        y: args.average,
+        type: "scatter",
+        mode: "lines",
+        name: "3-reading average",
+        line: {color:"#F2B766", width:2.5},
+        connectgaps:false,
+        hovertemplate:"Recent sample %{x}<br>3-reading average: %{y:.1f} °C<extra></extra>"
+      };
+
+      const latestTrace = {
+        x:[args.latest_x],
+        y:[args.latest_temp],
+        type:"scatter",
+        mode:"markers+text",
+        text:[args.latest_temp.toFixed(1) + " °C"],
+        textposition:"top center",
+        cliponaxis:false,
+        textfont:{color:"#FFFFFF", size:13},
+        marker:{color:"#55B4E5", size:13, line:{color:"#FFFFFF", width:2}},
+        name:"Latest reading",
+        showlegend:false,
+        hovertemplate:"LATEST READING<br>%{y:.1f} °C<extra></extra>"
+      };
+
+      const data = [rawTrace, averageTrace, latestTrace];
+      if (args.latest_average !== null && args.latest_average !== undefined) {
+        data.push({
+          x:[args.latest_x],
+          y:[args.latest_average],
+          type:"scatter",
+          mode:"markers",
+          marker:{color:"#F2B766", size:10, line:{color:"#202624", width:1}},
+          showlegend:false,
+          hovertemplate:"Latest 3-reading average: %{y:.1f} °C<extra></extra>"
+        });
+      }
+
+      const layout = {
+        height:330,
+        autosize:true,
+        margin:{l:48, r:48, t:34, b:48},
+        paper_bgcolor:"rgba(0,0,0,0)",
+        plot_bgcolor:"rgba(10,15,20,0.72)",
+        font:{color:"#D8DED9", family:"Roboto, sans-serif", size:11},
+        legend:{orientation:"h", yanchor:"bottom", y:1.02, xanchor:"left", x:0},
+        hovermode:"x unified",
+        xaxis:{
+          title:"Recent readings · newest at right",
+          range:[1,64], dtick:5, showgrid:false, zeroline:false,
+          fixedrange:true, color:"#D8DED9"
+        },
+        yaxis:{
+          title:"Temperature (°C)", rangemode:"normal",
+          gridcolor:"rgba(180,195,190,0.15)", zeroline:false,
+          color:"#D8DED9"
+        },
+        uirevision:"sentinel-temperature-live",
+        transition:{duration:850, easing:"linear"}
+      };
+
+      const config = {displayModeBar:false, responsive:true};
+      if (!chartReady) {
+        Plotly.newPlot(chart, data, layout, config).then(() => {
+          chartReady = true;
+          Streamlit.setFrameHeight(350);
+        });
+      } else {
+        // The iframe and graph DOM remain mounted. Only trace data is updated.
+        Plotly.react(chart, data, layout, config);
+      }
+    }
+
+    function onRender(event) {
+      lastArgs = event.detail.args;
+      renderChart(lastArgs);
+    }
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(350);
+
+    // Handle the rare case where Streamlit sends data before Plotly finishes loading.
+    const waitForPlotly = setInterval(() => {
+      if (window.Plotly && lastArgs) {
+        clearInterval(waitForPlotly);
+        renderChart(lastArgs);
+      }
+    }, 100);
+  </script>
+</body>
+</html>
