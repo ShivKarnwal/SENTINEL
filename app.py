@@ -1,12 +1,19 @@
 import base64
-import random
+import json
 import shutil
+import subprocess
+import time
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import serial
+from serial.tools import list_ports
 import streamlit as st
 
 # Optional local AI/webcam dependencies. The environmental dashboard can still
@@ -28,15 +35,70 @@ except Exception as ai_import_exc:
     MobileNet_V3_Small_Weights = None
     AI_IMPORT_ERROR = str(ai_import_exc)
 
-from processing.analyzer import calculate_rolling_average
+from processing.analyzer import calculate_rolling_average, detect_temperature_anomalies
 
 BASE = Path(__file__).resolve().parent
 BG = BASE / "assets" / "plant_bg.jpg"
 CSV = BASE / "storage" / "dashboard_readings.csv"
+SETTINGS_FILE = BASE / "storage" / "sentinel_settings.json"
 AI_ROOT = BASE / "processing" / "SENTINEL_AI"
 AI_MODEL_PATH = AI_ROOT / "models" / "sentinel_mobilenetv3_small_finetuned_best.pth"
 MAX_CSV_ROWS = 10_000
 RETENTION_CHECK_INTERVAL = 100
+ARDUINO_BAUD_RATE = 9600
+ARDUINO_STALE_SECONDS = 5.5
+ARDUINO_FQBN = "arduino:avr:uno"
+ARDUINO_SKETCH_DIR = BASE / "acquisition" / "arduino_firmware" / "SENTINEL_Sensors"
+ARDUINO_SKETCH_PATH = ARDUINO_SKETCH_DIR / "SENTINEL_Sensors.ino"
+ZERO_READING = {"temperature": 0.0, "humidity": 0.0, "light": 0}
+
+
+def load_saved_app_settings():
+    """Load persisted SENTINEL settings without failing on a missing file."""
+    try:
+        if SETTINGS_FILE.exists():
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_app_settings(updates):
+    """Update settings atomically while preserving unrelated settings."""
+    data = load_saved_app_settings()
+    data.update(updates)
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS_FILE.with_suffix(SETTINGS_FILE.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    temporary.replace(SETTINGS_FILE)
+
+
+def send_ntfy_notification(topic, title, message, priority="high", tags="warning"):
+    """Send one push notification through ntfy.sh using its HTTP publish API."""
+    topic = str(topic or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", topic):
+        return False, "Enter a topic containing 8–64 letters, numbers, hyphens or underscores."
+
+    url = "https://ntfy.sh/" + urllib.parse.quote(topic, safe="")
+    request = urllib.request.Request(
+        url,
+        data=str(message).encode("utf-8"),
+        headers={
+            "Title": str(title),
+            "Priority": str(priority),
+            "Tags": str(tags),
+            "Content-Type": "text/plain; charset=utf-8",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=4) as response:
+            if 200 <= response.status < 300:
+                return True, ""
+            return False, f"ntfy returned HTTP {response.status}."
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, str(exc)
 
 st.set_page_config(page_title="SENTINEL | Plant Environment", page_icon="🌱", layout="wide")
 
@@ -95,7 +157,28 @@ div[data-testid="stMetricValue"] {{color:#f1ebdf;}}
 </style>
 """, unsafe_allow_html=True)
 
-
+# Alert visuals are injected only while an environmental alert is active.
+ALERT_STYLE = """
+<style>
+.stApp { background: radial-gradient(circle at center, #7f1010 0%, #390606 65%, #170202 100%) !important; }
+[data-testid="stHeader"] { background: rgba(70,0,0,.35) !important; }
+.sentinel-alert-overlay {
+ position: fixed; inset: 0; z-index: 999999; pointer-events: none;
+ border: 10px solid #ff2424; box-shadow: inset 0 0 100px 25px rgba(255,0,0,.55);
+ animation: sentinel-alert-pulse .75s infinite alternate;
+}
+.sentinel-alert-banner {
+ position: fixed; z-index: 1000000; top: 18px; left: 50%; transform: translateX(-50%);
+ width: min(760px, 92vw); padding: 18px 24px; border: 2px solid #fff;
+ border-radius: 14px; background: rgba(145,0,0,.97); color: #fff;
+ text-align: center; box-shadow: 0 0 35px rgba(255,0,0,.85);
+ font-family: Arial, sans-serif; animation: sentinel-alert-pulse .75s infinite alternate;
+}
+.sentinel-alert-banner h2 { color:#fff !important; margin:0 0 6px 0; font-size: clamp(22px,3vw,36px); }
+.sentinel-alert-banner p { color:#fff; margin:0; font-weight:700; }
+@keyframes sentinel-alert-pulse { from { opacity:.78; } to { opacity:1; } }
+</style>
+"""
 
 # ---------------------------- SENTINEL AI / Webcam ----------------------------
 @st.cache_resource(show_spinner=False)
@@ -334,17 +417,6 @@ def render_webcam_ai_panel():
         "plant is absent. PlantVillage test accuracy does not guarantee webcam accuracy."
     )
 
-def simulated_reading():
-    old = st.session_state.simulation
-    current = {
-        "temperature": round(max(15, min(40, old["temperature"] + random.uniform(-.7, .7))), 1),
-        "humidity": round(max(20, min(100, old["humidity"] + random.uniform(-1.8, 1.8))), 1),
-        "light": int(max(0, min(1023, old["light"] + random.randint(-28, 28)))),
-    }
-    st.session_state.simulation = current
-    return current
-
-
 def parse_sensor_line(line):
     """Convert one CSV serial line into validated sensor values."""
     parts = line.strip().split(",")
@@ -364,25 +436,199 @@ def parse_sensor_line(line):
     }
 
 
+def classify_light_level(adc_value):
+    """Classify the user's LDR readings; return 0 when no valid sample exists."""
+    value = int(adc_value)
+    if value <= 0:
+        return "0"
+    # Calibrated to the observed module values: bright ~75, moderate ~350,
+    # dark ~750. These are practical starting boundaries, not lux values.
+    if value <= 200:
+        return "BRIGHT"
+    if value <= 550:
+        return "MODERATE"
+    return "DARK"
+
+
+SENTINEL_ARDUINO_SKETCH = r"""#include <DHT.h>
+
+// SENTINEL firmware for Arduino Uno
+// DHT22 DATA -> D2; LM35 VOUT -> A0; LDR module AO -> A1
+#define DHT_PIN 2
+#define DHT_TYPE DHT22
+#define LM35_PIN A0
+#define LDR_PIN A1
+
+DHT dht(DHT_PIN, DHT_TYPE);
+const unsigned long SENSOR_INTERVAL_MS = 2000;
+unsigned long previousMillis = 0;
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  pinMode(LDR_PIN, INPUT);
+  delay(1000);
+  Serial.println("SENTINEL_READY");
+}
+
+void loop() {
+  const unsigned long now = millis();
+  if (now - previousMillis < SENSOR_INTERVAL_MS) return;
+  previousMillis = now;
+
+  const float temperature = dht.readTemperature();
+  const float humidity = dht.readHumidity();
+  const int lm35Raw = analogRead(LM35_PIN); // retained for future diagnostics
+  const int lightADC = analogRead(LDR_PIN);
+  (void)lm35Raw;
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("DHT22_ERROR");
+    return;
+  }
+
+  // CSV protocol consumed by app.py: temperature,humidity,lightADC
+  Serial.print(temperature, 1);
+  Serial.print(',');
+  Serial.print(humidity, 1);
+  Serial.print(',');
+  Serial.println(lightADC);
+}
+"""
+
+
+def find_arduino_cli():
+    """Find Arduino CLI on PATH or in the project's tools directory."""
+    executable = shutil.which("arduino-cli") or shutil.which("arduino-cli.exe")
+    if executable:
+        return executable
+    local_copy = BASE / "tools" / "arduino-cli.exe"
+    return str(local_copy) if local_copy.exists() else None
+
+
+def run_arduino_cli(args, timeout=240):
+    """Run Arduino CLI and return its completed process; raise useful errors."""
+    cli = find_arduino_cli()
+    if not cli:
+        raise RuntimeError(
+            "Arduino CLI is not installed or not on PATH. Install it once with "
+            "`winget install -e --id ArduinoSA.CLI`, then close and reopen PowerShell."
+        )
+    try:
+        result = subprocess.run(
+            [cli, *args], capture_output=True, text=True, timeout=timeout,
+            cwd=str(BASE), check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Arduino CLI timed out while running: {' '.join(args)}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "No details returned by Arduino CLI").strip()
+        raise RuntimeError(detail[-3000:])
+    return result
+
+
+def ensure_arduino_firmware_uploaded(port):
+    """Create, compile and upload SENTINEL firmware to the connected Uno."""
+    ARDUINO_SKETCH_DIR.mkdir(parents=True, exist_ok=True)
+    if not ARDUINO_SKETCH_PATH.exists() or ARDUINO_SKETCH_PATH.read_text(encoding="utf-8") != SENTINEL_ARDUINO_SKETCH:
+        ARDUINO_SKETCH_PATH.write_text(SENTINEL_ARDUINO_SKETCH, encoding="utf-8")
+
+    # Install the Uno board core and sensor library automatically when missing.
+    core_list = run_arduino_cli(["core", "list"], timeout=90).stdout
+    if "arduino:avr" not in core_list:
+        run_arduino_cli(["core", "update-index"], timeout=180)
+        run_arduino_cli(["core", "install", "arduino:avr"], timeout=300)
+
+    run_arduino_cli(["lib", "update-index"], timeout=180)
+    library_list = run_arduino_cli(["lib", "list"], timeout=120).stdout.lower()
+    if "dht sensor library" not in library_list:
+        run_arduino_cli(["lib", "install", "DHT sensor library"], timeout=240)
+    library_list = run_arduino_cli(["lib", "list"], timeout=120).stdout.lower()
+    if "adafruit unified sensor" not in library_list:
+        run_arduino_cli(["lib", "install", "Adafruit Unified Sensor"], timeout=240)
+
+    run_arduino_cli(
+        ["compile", "--fqbn", ARDUINO_FQBN, str(ARDUINO_SKETCH_DIR)], timeout=300
+    )
+    run_arduino_cli(
+        ["upload", "-p", port, "--fqbn", ARDUINO_FQBN, str(ARDUINO_SKETCH_DIR)], timeout=180
+    )
+    # Upload resets the Uno; give its bootloader and DHT22 time to start.
+    time.sleep(2.5)
+
+
+def get_available_serial_ports():
+    """Return currently available serial port devices, such as COM3 or COM5."""
+    try:
+        return sorted(list_ports.comports(), key=lambda item: item.device)
+    except Exception:
+        return []
+
+
+def resolve_arduino_port(port_choice):
+    """Resolve the selected port only while that USB serial device is present."""
+    ports = get_available_serial_ports()
+    if port_choice and port_choice != "Auto-detect":
+        return port_choice if any(item.device == port_choice for item in ports) else None
+
+    if not ports:
+        return None
+
+    # Prefer common Arduino / USB-to-serial descriptions, then use the only or
+    # first available serial device as a fallback.
+    keywords = ("arduino", "ch340", "usb serial", "usb-serial", "ftdi", "cp210")
+    for item in ports:
+        description = " ".join(
+            str(value or "") for value in
+            (item.description, item.manufacturer, item.product)
+        ).lower()
+        if any(keyword in description for keyword in keywords):
+            return item.device
+    return ports[0].device
+
+
 @st.cache_resource(show_spinner=False)
-def get_serial_connection(port, baud_rate=9600):
-    """Keep one serial connection open instead of reopening it on every refresh."""
+def get_serial_connection(port, baud_rate=ARDUINO_BAUD_RATE):
+    """Keep one serial connection open instead of resetting the Uno every refresh."""
     return serial.Serial(port, baud_rate, timeout=0.25)
 
 
-def read_available_arduino_readings(port):
-    """Read all complete lines currently queued on the persistent serial port."""
-    device = get_serial_connection(port)
-    lines = []
+def close_arduino_connection(clear_cache=False):
+    """Close this session's active serial handle and optionally clear its cache."""
+    device = st.session_state.get("_arduino_device")
+    if device is not None:
+        try:
+            if device.is_open:
+                device.close()
+        except Exception:
+            pass
+    st.session_state.pop("_arduino_device", None)
+    st.session_state.pop("_active_arduino_port", None)
+    if clear_cache:
+        try:
+            get_serial_connection.clear()
+        except Exception:
+            pass
 
-    # Wait briefly for the next line. Do NOT reset the input buffer here:
-    # resetting it discards readings that arrived between dashboard refreshes.
+
+def read_available_arduino_readings(port):
+    """Read every complete CSV sample currently queued by the Arduino Uno."""
+    previous_port = st.session_state.get("_active_arduino_port")
+    if previous_port != port:
+        close_arduino_connection(clear_cache=True)
+        st.session_state["_active_arduino_port"] = port
+
+    device = get_serial_connection(port)
+    st.session_state["_arduino_device"] = device
+    if not device.is_open:
+        raise serial.SerialException(f"Serial port {port} is not open")
+
+    lines = []
+    # Do not reset the input buffer: that would discard samples between refreshes.
     first_line = device.readline().decode("utf-8", errors="ignore").strip()
     if first_line:
         lines.append(first_line)
 
-    # Drain any additional complete lines already waiting, so delayed UI
-    # refreshes do not silently throw away samples.
     while device.in_waiting:
         extra = device.readline().decode("utf-8", errors="ignore").strip()
         if not extra:
@@ -391,13 +637,15 @@ def read_available_arduino_readings(port):
 
     readings = []
     for line in lines:
+        # Keep the most recent raw line visible for troubleshooting when the
+        # Arduino sends an error/status message instead of the expected CSV.
+        st.session_state["last_serial_message"] = line
         try:
             readings.append(parse_sensor_line(line))
         except (ValueError, TypeError):
-            # Ignore incomplete boot messages or malformed serial lines.
+            # Ignore startup text, partial lines, and malformed serial messages.
             continue
     return readings
-
 
 def trim_csv_history(max_rows=MAX_CSV_ROWS):
     """Keep the newest max_rows records, preserving the CSV header."""
@@ -486,16 +734,73 @@ def load_history():
 
 
 # ---------------------------- Session state ----------------------------
-if "simulation" not in st.session_state:
-    st.session_state.simulation = {"temperature": 22.0, "humidity": 65.0, "light": 600}
 if "session_history" not in st.session_state:
     st.session_state.session_history = []
 if "latest_reading" not in st.session_state:
-    st.session_state.latest_reading = None
+    st.session_state.latest_reading = ZERO_READING.copy()
 if "last_reading_time" not in st.session_state:
     st.session_state.last_reading_time = None
 if "serial_error" not in st.session_state:
     st.session_state.serial_error = None
+if "last_serial_message" not in st.session_state:
+    st.session_state.last_serial_message = ""
+if "previous_valid_temperature" not in st.session_state:
+    st.session_state.previous_valid_temperature = None
+if "high_temperature_active" not in st.session_state:
+    st.session_state.high_temperature_active = False
+if "alert_sound_token" not in st.session_state:
+    st.session_state.alert_sound_token = 0
+if "sudden_change_alert_until" not in st.session_state:
+    st.session_state.sudden_change_alert_until = 0.0
+if "sudden_change_alert_text" not in st.session_state:
+    st.session_state.sudden_change_alert_text = ""
+if "sudden_change_active" not in st.session_state:
+    st.session_state.sudden_change_active = False
+if "arduino_firmware_status" not in st.session_state:
+    st.session_state.arduino_firmware_status = "Firmware upload has not started."
+if "arduino_firmware_uploaded_port" not in st.session_state:
+    st.session_state.arduino_firmware_uploaded_port = None
+if "arduino_firmware_attempted_port" not in st.session_state:
+    st.session_state.arduino_firmware_attempted_port = None
+def load_saved_temperature_threshold():
+    """Load the user's threshold from disk so page/session reloads cannot reset it."""
+    try:
+        if SETTINGS_FILE.exists():
+            saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            value = float(saved.get("high_temperature_threshold", 35.0))
+            if 0.0 <= value <= 100.0:
+                return value
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return 35.0
+
+
+def save_temperature_threshold():
+    """Persist a changed threshold immediately when the Settings input changes."""
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"high_temperature_threshold": float(st.session_state.high_temperature_threshold)}
+        SETTINGS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except (OSError, ValueError, TypeError) as exc:
+        st.session_state.temperature_threshold_save_error = str(exc)
+    else:
+        st.session_state.temperature_threshold_save_error = ""
+
+
+if "high_temperature_threshold" not in st.session_state:
+    st.session_state.high_temperature_threshold = load_saved_temperature_threshold()
+if "ntfy_topic" not in st.session_state:
+    st.session_state.ntfy_topic = str(load_saved_app_settings().get("ntfy_topic", ""))
+if "ntfy_enabled" not in st.session_state:
+    st.session_state.ntfy_enabled = bool(load_saved_app_settings().get("ntfy_enabled", False))
+if "ntfy_previous_alerts" not in st.session_state:
+    st.session_state.ntfy_previous_alerts = {}
+if "ntfy_last_error" not in st.session_state:
+    st.session_state.ntfy_last_error = ""
+if "ntfy_last_sent" not in st.session_state:
+    st.session_state.ntfy_last_sent = "No notifications sent in this session yet."
+if "force_firmware_upload" not in st.session_state:
+    st.session_state.force_firmware_upload = False
 if "retention_check_counter" not in st.session_state:
     st.session_state.retention_check_counter = 0
 if "last_retention_removed" not in st.session_state:
@@ -513,8 +818,7 @@ with st.sidebar:
     st.markdown('<hr class="sidebar-rule">', unsafe_allow_html=True)
 
     pages = {
-        "⌂　 Overview": "Overview",
-        "⌁　 Live Sensors": "Live Sensors",
+        "⌂　 Live Sensors": "Overview",
         "⌁　 History": "History",
         "♧　 Alerts": "Alerts",
         "⚙　 Settings": "Settings",
@@ -529,16 +833,40 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.markdown('<div class="muted">PLANT ZONE</div>', unsafe_allow_html=True)
-    st.selectbox("Plant zone", ["Greenhouse A"], label_visibility="collapsed")
-    st.caption("ID: GH-A-001")
+    plant_zones = {
+        "Greenhouse A": "GH-A-001",
+        "Greenhouse B": "GH-B-002",
+        "Greenhouse C": "GH-C-003",
+        "Greenhouse D": "GH-D-004",
+        "Greenhouse E": "GH-E-005",
+    }
+    selected_zone = st.selectbox(
+        "Plant zone",
+        list(plant_zones.keys()),
+        label_visibility="collapsed",
+        key="selected_plant_zone",
+    )
+    st.caption(f"ID: {plant_zones[selected_zone]}")
     st.markdown('<hr class="sidebar-rule">', unsafe_allow_html=True)
 
-    source = st.selectbox("Data Source", ["Simulation", "Arduino USB"], key="data_source")
-    port = st.text_input(
-        "Arduino Port", "/dev/ttyACM0", key="arduino_port",
-        disabled=(source != "Arduino USB")
+    detected_ports = get_available_serial_ports()
+    port_options = ["Auto-detect"] + [item.device for item in detected_ports]
+    port_choice = st.selectbox(
+        "Arduino Uno Port",
+        port_options,
+        index=0,
+        key="arduino_port_choice",
+        help="Auto-detect scans for the Arduino Uno USB serial connection."
     )
+    if st.button("Retry Arduino firmware upload", use_container_width=True):
+        st.session_state.force_firmware_upload = True
+        st.session_state.arduino_firmware_uploaded_port = None
+        st.session_state.arduino_firmware_attempted_port = None
     refresh_rate = st.selectbox("Dashboard update rate", ["1 second", "2 seconds"], index=0)
+    alarm_sound_enabled = st.checkbox(
+        "Enable alert sound", value=True, key="alarm_sound_enabled",
+        help="The browser may require one interaction with this page before it permits alarm audio."
+    )
     refresh_seconds = 1 if refresh_rate == "1 second" else 2
     st.markdown("<br>", unsafe_allow_html=True)
     st.caption("SENTINEL Local Prototype")
@@ -552,28 +880,84 @@ st.caption("Live values update independently; the dashboard layout stays in plac
 # ---------------------------- Partial live update ----------------------------
 @st.fragment(run_every=f"{refresh_seconds}s")
 def live_panel():
-    """Only this region reruns on the timer; sidebar and layout remain still."""
+    """Refresh only live sensor content while keeping the rest of the page still."""
     new_readings = []
     error = None
+    port = resolve_arduino_port(port_choice)
 
-    if source == "Simulation":
-        new_readings = [simulated_reading()]
+    if port is None:
+        close_arduino_connection(clear_cache=True)
+        st.session_state.latest_reading = ZERO_READING.copy()
+        st.session_state.last_reading_time = None
+        st.session_state.previous_valid_temperature = None
+        st.session_state.high_temperature_active = False
+        st.session_state.sudden_change_alert_until = 0.0
+        st.session_state.sudden_change_active = False
+        st.session_state.serial_error = "Arduino Uno not detected"
+        st.session_state.arduino_firmware_uploaded_port = None
+        st.session_state.arduino_firmware_attempted_port = None
+        st.session_state.arduino_firmware_status = "Waiting for Arduino Uno USB connection."
     else:
         try:
+            # Automatically compile and flash firmware once per detected port.
+            # A manual retry button is provided if the first upload fails.
+            if (
+                st.session_state.arduino_firmware_uploaded_port != port
+                and st.session_state.arduino_firmware_attempted_port != port
+            ) or st.session_state.force_firmware_upload:
+                close_arduino_connection(clear_cache=True)
+                st.session_state.arduino_firmware_attempted_port = port
+                st.session_state.arduino_firmware_status = f"Preparing firmware for {port}..."
+                ensure_arduino_firmware_uploaded(port)
+                st.session_state.arduino_firmware_uploaded_port = port
+                st.session_state.force_firmware_upload = False
+                st.session_state.arduino_firmware_status = f"SENTINEL firmware uploaded successfully to {port}."
             new_readings = read_available_arduino_readings(port)
             st.session_state.serial_error = None
-        except (serial.SerialException, OSError, ValueError) as exc:
+        except (serial.SerialException, OSError, ValueError, RuntimeError) as exc:
             error = str(exc)
             st.session_state.serial_error = error
-            # Release a failed connection so the next fragment run can reconnect.
-            try:
-                get_serial_connection.clear()
-            except Exception:
-                pass
+            st.session_state.arduino_firmware_status = f"Firmware / connection setup failed: {error}"
+            close_arduino_connection(clear_cache=True)
+            st.session_state.latest_reading = ZERO_READING.copy()
+            st.session_state.last_reading_time = None
+            st.session_state.previous_valid_temperature = None
+            st.session_state.high_temperature_active = False
+            st.session_state.sudden_change_alert_until = 0.0
+            st.session_state.sudden_change_active = False
 
     if new_readings:
         now = datetime.now()
-        for offset, item in enumerate(new_readings):
+        for item in new_readings:
+            current_temp = float(item["temperature"])
+            previous_temp = st.session_state.previous_valid_temperature
+            anomaly_messages = detect_temperature_anomalies(
+                current_temperature=current_temp,
+                previous_temperature=previous_temp,
+                high_temp_threshold=float(st.session_state.high_temperature_threshold),
+                deviation_threshold=5.0,
+            )
+            sudden_messages = [m for m in anomaly_messages if m.startswith("Sudden")]
+            if sudden_messages:
+                st.session_state.sudden_change_alert_text = sudden_messages[-1]
+                st.session_state.sudden_change_active = True
+                st.session_state.alert_sound_token += 1
+            elif (
+                st.session_state.get("sudden_change_active", False)
+                and previous_temp is not None
+                and abs(current_temp - float(previous_temp)) <= 5.0
+                and current_temp <= float(st.session_state.high_temperature_threshold)
+            ):
+                # Keep the sudden-change alarm latched until a subsequent
+                # valid sample is stable and the temperature is back to normal.
+                st.session_state.sudden_change_active = False
+            # High temperature is a sustained condition. Sound only when it first activates.
+            was_high = bool(st.session_state.get("high_temperature_active", False))
+            is_high = current_temp > float(st.session_state.high_temperature_threshold)
+            if is_high and not was_high:
+                st.session_state.alert_sound_token += 1
+            st.session_state.high_temperature_active = is_high
+            st.session_state.previous_valid_temperature = current_temp
             record = {"timestamp": now, **item}
             st.session_state.session_history.append(record)
         st.session_state.session_history = st.session_state.session_history[-1000:]
@@ -581,34 +965,212 @@ def live_panel():
         st.session_state.last_reading_time = now
         save_readings(new_readings)
 
-    reading = st.session_state.latest_reading
+    # If the Arduino stops sending data, do not leave stale values on screen.
+    last_update = st.session_state.last_reading_time
+    if last_update is not None:
+        age = (datetime.now() - last_update).total_seconds()
+        if age > ARDUINO_STALE_SECONDS:
+            st.session_state.latest_reading = ZERO_READING.copy()
+            st.session_state.last_reading_time = None
+            st.session_state.previous_valid_temperature = None
+            st.session_state.high_temperature_active = False
+            st.session_state.sudden_change_alert_until = 0.0
+            st.session_state.sudden_change_active = False
+
+    reading = st.session_state.latest_reading or ZERO_READING.copy()
+    connected = port is not None and st.session_state.serial_error is None
+
+    firmware_status = st.session_state.get("arduino_firmware_status", "")
+    if firmware_status:
+        if "uploaded successfully" in firmware_status:
+            st.success(firmware_status)
+        elif "failed" in firmware_status.lower():
+            st.error(firmware_status)
+        else:
+            st.info(firmware_status)
 
     if error:
-        st.error(f"Arduino connection problem: {error}")
-    elif source == "Arduino USB" and reading is None:
-        st.info("Waiting for the first Arduino reading. Check that the sketch sends CSV lines at 9600 baud.")
-    elif source == "Arduino USB" and not new_readings:
-        st.caption("Connection active · waiting for next sensor sample")
+        st.error(f"Arduino connection problem: {error}. Sensor values have been reset to zero.")
+    elif port is None:
+        st.warning("Arduino Uno not detected. Temperature, humidity and light are set to zero.")
+    elif st.session_state.last_reading_time is None:
+        st.info(
+            f"Arduino port {port} selected. Waiting for valid sensor data at "
+            f"{ARDUINO_BAUD_RATE} baud; readings remain zero until data arrives."
+        )
+        last_message = st.session_state.get("last_serial_message", "")
+        if last_message:
+            st.caption(f"Last Arduino serial message (not accepted as sensor data): {last_message}")
+    elif not new_readings:
+        st.caption(f"Arduino connected on {port} · waiting for next sensor sample")
 
-    if reading is not None:
-        label = "SIMULATED DATA" if source == "Simulation" else "LIVE ARDUINO CONNECTION"
+    if connected and st.session_state.last_reading_time is not None:
         updated = st.session_state.last_reading_time
         st.markdown(
-            f'<div class="status-line">● {label}</div>'
-            f'<div class="muted">Last updated: {updated.strftime("%I:%M:%S %p") if updated else "—"}</div>',
+            '<div class="status-line">● LIVE ARDUINO CONNECTION</div>'
+            f'<div class="muted">Port: {port} · Last updated: {updated.strftime("%I:%M:%S %p")}</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="muted">● ARDUINO OFFLINE · Current sensor values: 0</div>',
             unsafe_allow_html=True,
         )
 
-    if page == "Overview":
-        if reading is None:
-            st.info("Select Simulation or connect the Arduino to display readings.")
-            return
+    # Build the active alert list from the latest valid live reading and the
+    # latched sudden-change event. Sudden rise AND sudden fall are treated equally.
+    active_alerts = []
+    if connected and st.session_state.last_reading_time is not None:
+        current_temp = float(reading["temperature"])
+        if current_temp > float(st.session_state.high_temperature_threshold):
+            active_alerts.append(
+                f"HIGH TEMPERATURE: {current_temp:.1f} °C "
+                f"(limit: {float(st.session_state.high_temperature_threshold):g} °C)"
+            )
+        if st.session_state.get("sudden_change_active", False):
+            active_alerts.append(st.session_state.sudden_change_alert_text)
 
+    # Publish only alert-state transitions, not every 1–2 second fragment refresh.
+    # Stable keys prevent changing temperature text from creating duplicate alerts.
+    current_ntfy_alerts = {}
+    if connected and st.session_state.last_reading_time is not None:
+        current_temperature = float(reading["temperature"])
+        if current_temperature > float(st.session_state.high_temperature_threshold):
+            current_ntfy_alerts["high_temperature"] = (
+                f"Temperature is {current_temperature:.1f} °C; configured limit is "
+                f"{float(st.session_state.high_temperature_threshold):g} °C."
+            )
+        if st.session_state.get("sudden_change_active", False):
+            current_ntfy_alerts["sudden_change"] = str(
+                st.session_state.get("sudden_change_alert_text", "Sudden temperature change detected.")
+            )
+
+    previous_ntfy_alerts = st.session_state.ntfy_previous_alerts
+    if st.session_state.ntfy_enabled and st.session_state.ntfy_topic.strip():
+        # A valid connected sample is required before declaring an alert recovered.
+        for alert_key, alert_message in current_ntfy_alerts.items():
+            if alert_key not in previous_ntfy_alerts:
+                zone_name = st.session_state.get("selected_plant_zone", "Selected zone")
+                zone_id = plant_zones.get(zone_name, "")
+                notification_text = (
+                    f"⚠ SABOTAGE\nZone: {zone_name} ({zone_id})\n"
+                    f"{alert_message}\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}\n"
+                    "SENTINEL environmental monitoring system"
+                )
+                ok, detail = send_ntfy_notification(
+                    st.session_state.ntfy_topic,
+                    "SENTINEL: SABOTAGE ALERT",
+                    notification_text,
+                    priority="urgent" if alert_key == "high_temperature" else "high",
+                    tags="rotating_light,warning",
+                )
+                if ok:
+                    st.session_state.ntfy_last_error = ""
+                    st.session_state.ntfy_last_sent = f"Alert notification sent: {alert_key.replace('_', ' ')}"
+                else:
+                    st.session_state.ntfy_last_error = detail
+
+        if connected and st.session_state.last_reading_time is not None:
+            for alert_key, old_message in previous_ntfy_alerts.items():
+                if alert_key not in current_ntfy_alerts:
+                    zone_name = st.session_state.get("selected_plant_zone", "Selected zone")
+                    zone_id = plant_zones.get(zone_name, "")
+                    recovery_text = (
+                        f"✓ ALERT RESOLVED\nZone: {zone_name} ({zone_id})\n"
+                        f"Resolved condition: {old_message}\n"
+                        f"Current temperature: {float(reading['temperature']):.1f} °C\n"
+                        f"Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}\n"
+                        "SENTINEL has returned to normal for this alert condition."
+                    )
+                    ok, detail = send_ntfy_notification(
+                        st.session_state.ntfy_topic,
+                        "SENTINEL: ALERT RESOLVED",
+                        recovery_text,
+                        priority="default",
+                        tags="white_check_mark,seedling",
+                    )
+                    if ok:
+                        st.session_state.ntfy_last_error = ""
+                        st.session_state.ntfy_last_sent = f"Recovery notification sent: {alert_key.replace('_', ' ')}"
+                    else:
+                        st.session_state.ntfy_last_error = detail
+
+    # Keep the last known alert state while disconnected, so a USB interruption
+    # cannot generate a misleading recovery message.
+    if connected and st.session_state.last_reading_time is not None:
+        st.session_state.ntfy_previous_alerts = current_ntfy_alerts.copy()
+
+    if active_alerts:
+        st.markdown(ALERT_STYLE, unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sentinel-alert-overlay"></div>'
+            '<div class="sentinel-alert-banner"><h2>⚠ SABOTAGE</h2>'
+            + ''.join(f'<p>{msg}</p>' for msg in active_alerts)
+            + '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Invisible persistent browser audio. The visible red sound-control box is
+    # removed; the first ordinary page interaction unlocks audio where the browser
+    # requires a user gesture. Once unlocked, alerts start/stop automatically.
+    alarm_is_active = bool(active_alerts) and alarm_sound_enabled
+    st.components.v1.html(f"""
+    <html><body style="margin:0;padding:0;height:0;overflow:hidden">
+      <script>
+      (() => {{
+        const soundUrl = "https://www.myinstants.com/media/sounds/among-us-reactor-meldown-sound-effect-128-kbps-abdwap2.mp3";
+        const active = {str(alarm_is_active).lower()};
+        try {{
+          const doc = window.parent.document;
+          let audio = doc.getElementById('sentinel-reactor-meltdown-audio');
+          if (!audio) {{
+            audio = doc.createElement('audio');
+            audio.id = 'sentinel-reactor-meltdown-audio';
+            audio.src = soundUrl;
+            audio.preload = 'auto';
+            audio.loop = true;
+            audio.volume = 1.0;
+            doc.body.appendChild(audio);
+          }}
+          audio.loop = true;
+          audio.dataset.sentinelAlarmActive = active ? '1' : '0';
+          if (active) {{
+            const playPromise = audio.play();
+            if (playPromise && playPromise.catch) playPromise.catch(() => {{}});
+          }} else {{
+            audio.pause();
+            audio.currentTime = 0;
+          }}
+          if (!doc.documentElement.dataset.sentinelAudioUnlockBound) {{
+            doc.documentElement.dataset.sentinelAudioUnlockBound = '1';
+            const unlockAudio = () => {{
+              const player = doc.getElementById('sentinel-reactor-meltdown-audio');
+              if (player && player.dataset.sentinelAlarmActive === '1') {{
+                player.loop = true;
+                const promise = player.play();
+                if (promise && promise.catch) promise.catch(() => {{}});
+              }}
+            }};
+            doc.addEventListener('pointerdown', unlockAudio, true);
+            doc.addEventListener('keydown', unlockAudio, true);
+          }}
+        }} catch (e) {{}}
+      }})();
+      </script>
+    </body></html>
+    """, height=0)
+
+    if page == "Overview":
         c1, c2, c3 = st.columns(3, gap="medium")
         cards = [
             (c1, "♨", "Temperature", f"{reading['temperature']:.1f}", "°C", "#e38baa"),
             (c2, "💧", "Humidity", f"{reading['humidity']:.1f}", "%", "#82c99b"),
-            (c3, "☀", "Light Sensor", str(reading["light"]), "", "#e9c16f"),
+            (
+                c3, "☀", "Light Sensor",
+                classify_light_level(reading["light"]),
+                "" if reading["light"] == 0 else f"ADC {reading['light']}", "#e9c16f"
+            ),
         ]
         for col, icon, label, value, unit, color in cards:
             with col:
@@ -783,14 +1345,19 @@ def live_panel():
 
     elif page == "Live Sensors":
         st.subheader("Live Sensor Readings")
-        if reading is None:
-            st.info("Waiting for sensor data.")
-        else:
-            a, b, c = st.columns(3)
-            a.metric("Temperature", f"{reading['temperature']:.1f} °C")
-            b.metric("Humidity", f"{reading['humidity']:.1f} %")
-            c.metric("Light ADC", reading["light"])
-            st.caption("Light is the Arduino Uno raw 10-bit ADC value, not lux.")
+        a, b, c = st.columns(3)
+        a.metric("Temperature", f"{reading['temperature']:.1f} °C")
+        b.metric("Humidity", f"{reading['humidity']:.1f} %")
+        light_display = (
+            "0" if reading["light"] == 0
+            else f"{classify_light_level(reading['light'])} ADC {reading['light']}"
+        )
+        c.metric(
+            "Light Level",
+            light_display,
+            help=f"Raw LDR ADC reading: {reading['light']} (0-1023)"
+        )
+        st.caption("Light is the Arduino Uno raw 10-bit ADC value, not lux.")
 
     elif page == "History":
         st.subheader("Environmental History")
@@ -803,28 +1370,134 @@ def live_panel():
 
     elif page == "Alerts":
         st.subheader("Environmental Alerts")
-        if reading is None:
-            st.info("Waiting for sensor data.")
+        if not connected or st.session_state.last_reading_time is None:
+            st.info("Arduino sensor data is unavailable. Alerts will be evaluated when valid readings arrive.")
+        elif active_alerts:
+            for alert in active_alerts:
+                st.error(alert)
+            st.caption("Sudden-change alerts compare consecutive valid live readings; they are not calculated from the smoothed chart average.")
         else:
-            alerts = []
-            if reading["temperature"] >= 35:
-                alerts.append("High temperature reading (demo threshold: 35 °C).")
-            if reading["humidity"] >= 80:
-                alerts.append("High humidity reading (demo threshold: 80%).")
-            if reading["light"] < 300:
-                alerts.append("Low light ADC reading (demo threshold: 300).")
-            if alerts:
-                for alert in alerts:
-                    st.warning(alert)
-            else:
-                st.success("No configured threshold alerts right now.")
-            st.caption("These are demonstration thresholds, not validated plant-specific stress limits.")
+            st.success("No active temperature alerts.")
+        st.caption(f"High temperature: above {float(st.session_state.high_temperature_threshold):g} °C. Sudden rise or fall: absolute change greater than 5 °C between consecutive valid readings. The reactor alarm remains active until temperature is normal and a stable valid sample is received. These are prototype thresholds, not validated plant-specific safety limits.")
 
 
 if page == "Settings":
     st.subheader("System Settings")
-    st.write("Data source:", source)
-    st.write("Arduino serial port:", port if source == "Arduino USB" else "Not in use")
+    st.markdown("#### Alert Configuration")
+    st.caption(
+        "Set the alert limit, then click Apply. The selected value is written to "
+        "storage/sentinel_settings.json and remains in effect after dashboard reruns."
+    )
+
+    # Use a form so the one-second sensor fragment refresh cannot interrupt
+    # an in-progress edit. The committed value is persisted before rerunning.
+    if "high_temperature_threshold_input" not in st.session_state:
+        st.session_state.high_temperature_threshold_input = float(
+            st.session_state.high_temperature_threshold
+        )
+
+    with st.form("sentinel_temperature_threshold_form", clear_on_submit=False):
+        st.number_input(
+            "High-temperature alert threshold (°C)",
+            min_value=0.0,
+            max_value=100.0,
+            step=0.5,
+            key="high_temperature_threshold_input",
+            help="Alerts activate when a valid temperature reading rises above this value.",
+        )
+        apply_threshold = st.form_submit_button("Apply threshold")
+
+    if apply_threshold:
+        selected_threshold = float(st.session_state.high_temperature_threshold_input)
+        st.session_state.high_temperature_threshold = selected_threshold
+        try:
+            save_app_settings({"high_temperature_threshold": selected_threshold})
+            st.session_state.temperature_threshold_save_error = ""
+            st.success(f"Threshold saved: {selected_threshold:g} °C")
+        except (OSError, ValueError, TypeError) as exc:
+            st.session_state.temperature_threshold_save_error = str(exc)
+            st.error(f"Could not save the temperature threshold: {exc}")
+
+    st.caption(
+        f"Active high-temperature alert threshold: "
+        f"{float(st.session_state.high_temperature_threshold):g} °C"
+    )
+    if st.session_state.get("temperature_threshold_save_error"):
+        st.error(
+            "Could not save the temperature threshold: "
+            f"{st.session_state.temperature_threshold_save_error}"
+        )
+
+    st.divider()
+    st.markdown("#### Phone Push Notifications (ntfy)")
+    st.caption(
+        "Create a private topic in the ntfy app on your phone, subscribe to the same topic, "
+        "then enter it here. Treat the topic name like a password: anyone who knows it "
+        "may be able to publish to or subscribe to its notifications."
+    )
+    if "ntfy_topic_input" not in st.session_state:
+        st.session_state.ntfy_topic_input = st.session_state.ntfy_topic
+    if "ntfy_enabled_input" not in st.session_state:
+        st.session_state.ntfy_enabled_input = st.session_state.ntfy_enabled
+
+    with st.form("sentinel_ntfy_settings_form", clear_on_submit=False):
+        st.text_input(
+            "Private ntfy topic",
+            key="ntfy_topic_input",
+            placeholder="Example: sentinel-plant-a-unique-random-name",
+            help="Use a hard-to-guess topic name, 8–64 characters: letters, numbers, hyphens or underscores.",
+        )
+        st.checkbox("Enable phone notifications", key="ntfy_enabled_input")
+        save_ntfy_settings = st.form_submit_button("Save ntfy settings")
+
+    if save_ntfy_settings:
+        selected_topic = str(st.session_state.ntfy_topic_input or "").strip()
+        selected_enabled = bool(st.session_state.ntfy_enabled_input)
+        if selected_enabled and not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", selected_topic):
+            st.error("Enter a valid private topic (8–64 letters, numbers, hyphens or underscores) before enabling notifications.")
+        else:
+            st.session_state.ntfy_topic = selected_topic
+            st.session_state.ntfy_enabled = selected_enabled
+            # Re-evaluate active conditions against the newly saved destination.
+            st.session_state.ntfy_previous_alerts = {}
+            try:
+                save_app_settings({"ntfy_topic": selected_topic, "ntfy_enabled": selected_enabled})
+                st.session_state.ntfy_last_error = ""
+                st.success("ntfy settings saved.")
+            except OSError as exc:
+                st.session_state.ntfy_last_error = str(exc)
+                st.error(f"Could not save ntfy settings: {exc}")
+
+    st.write("Phone notifications:", "Enabled" if st.session_state.ntfy_enabled else "Disabled")
+    st.write("ntfy delivery status:", st.session_state.ntfy_last_sent)
+    if st.button("Send test phone notification", disabled=not (st.session_state.ntfy_enabled and st.session_state.ntfy_topic.strip())):
+        ok, detail = send_ntfy_notification(
+            st.session_state.ntfy_topic,
+            "SENTINEL: TEST NOTIFICATION",
+            "Test successful. Your phone is subscribed to SENTINEL notifications.",
+            priority="default",
+            tags="white_check_mark,seedling",
+        )
+        if ok:
+            st.session_state.ntfy_last_error = ""
+            st.session_state.ntfy_last_sent = "Test notification sent successfully."
+            st.success("Test notification sent. Check the ntfy app on your phone.")
+        else:
+            st.session_state.ntfy_last_error = detail
+            st.error(f"Test notification failed: {detail}")
+    if st.session_state.ntfy_last_error:
+        st.warning(f"Last ntfy delivery/configuration error: {st.session_state.ntfy_last_error}")
+    st.divider()
+    st.write("Data source: Arduino Uno (USB serial)")
+    st.write("Firmware management: Automatic via Arduino CLI (no Arduino IDE window required)")
+    st.write("Firmware status:", st.session_state.get("arduino_firmware_status", "Not started"))
+    st.write("Selected port:", port_choice)
+    st.write("Detected ports:", ", ".join(item.device for item in get_available_serial_ports()) or "None")
+    settings_connected = (
+        st.session_state.get("last_reading_time") is not None
+        and st.session_state.get("serial_error") is None
+    )
+    st.write("Connection status:", "Connected" if settings_connected else "Disconnected / waiting for data")
     st.write("Update interval:", refresh_rate)
     st.write("CSV storage file:", str(CSV))
     st.write("Background image:", str(BG))

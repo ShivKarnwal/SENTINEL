@@ -1,0 +1,5 @@
+{
+  "high_temperature_threshold": 35.0,
+  "ntfy_topic": "SENTINEL_ALERT",
+  "ntfy_enabled": true
+}

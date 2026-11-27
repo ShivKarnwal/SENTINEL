@@ -34,3 +34,14 @@ camera/captures/
 # Training temporary files
 *.pth.tmp
 *.pt.tmp
+# Python virtual environments
+sentinel_win312/
+sentinel_env/
+.venv/
+venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+sentinel_win312/
